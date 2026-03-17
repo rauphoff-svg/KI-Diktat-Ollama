@@ -24,7 +24,7 @@ transcription:
 correction:
   # Ollama-Modell: "mistral-small:latest" oder "gemma3:latest"
   model: "mistral-small:latest"
-  ollama_base_url: "http://localhost:11434"
+  ollama_base_url: "http://192.168.178.52:11434"
   max_tokens: 4096
   # Temperature: 0.1 = strikt texttreu
   temperature: 0.1
