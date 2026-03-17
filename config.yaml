@@ -1,0 +1,46 @@
+# ============================================================
+# KI-Diktat-Ollama – Konfiguration
+# Vollständig lokale Lösung: FasterWhisper + Ollama
+# Kein Datenaustausch mit externen Servern
+# ============================================================
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  blocksize: 2048
+  # RMS-Schwellwert: Segmente unter diesem Wert werden als Stille verworfen
+  silence_threshold_rms: 0.005
+
+transcription:
+  # FasterWhisper-Modell: tiny / base / small / medium / large-v3
+  # Empfehlung: medium (gute Qualität, vertretbare Geschwindigkeit)
+  model: "medium"
+  language: "de"
+  # Gerät: "cpu" oder "cuda" (falls NVIDIA-GPU vorhanden)
+  device: "cpu"
+  # Rechengenauigkeit: "int8" (schnell/CPU), "float16" (GPU), "float32"
+  compute_type: "int8"
+
+correction:
+  # Ollama-Modell: "mistral-small:latest" oder "gemma3:latest"
+  model: "mistral-small:latest"
+  ollama_base_url: "http://localhost:11434"
+  max_tokens: 4096
+  # Temperature: 0.1 = strikt texttreu
+  temperature: 0.1
+  # Absatzweise Korrektur mit Kontext
+  paragraph_wise: true
+
+output:
+  # Format: "docx" oder "txt"
+  format: "txt"
+  directory: "."
+  docx_font: "Arial"
+  docx_font_size_pt: 11
+  docx_template: null
+
+controls:
+  push_to_talk_key: "ctrl_r"    # Gedrückt halten = Aufnahme
+  pause_key: "f10"              # Diktat pausieren / fortsetzen
+  reject_segment_key: "f9"      # Letztes Segment verwerfen
+  segment_review: true
