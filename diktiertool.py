@@ -12,18 +12,23 @@ Backends:
   Transkription: FasterWhisper (lokal, Modell konfigurierbar)
   Korrektur:     Ollama (lokal) – mistral-small:latest oder gemma3:latest
 
+Aenderungsprotokoll v1.1:
+  - Aufnahmesteuerung: pynput Key-Objekte statt String-Vergleich (Bugfix)
+  - _KEY_MAP + resolve_key() wie in KI-Diktat-Voxtral-Claude
+  - recording_worker Thread wie im Original
+  - on_key_press / on_key_release als Klassenmethoden
+
 Aenderungsprotokoll v1:
   - Aufbau auf Basis von KI-Diktat-Voxtral-Claude v4.2
   - Transkription: Voxtral -> FasterWhisper (lokal)
   - Korrektur: Mistral/Claude -> Ollama (lokal)
-  - Backend-Wechsel: mistral-small <-> gemma3
+  - Modellwechsel: mistral-small <-> gemma3
 
 Abhaengigkeiten:
   pip install faster-whisper numpy sounddevice soundfile pyperclip pynput pyyaml python-docx
   Ollama muss lokal laufen (https://ollama.com)
 """
 
-import io
 import os
 import sys
 import json
@@ -39,7 +44,6 @@ from typing import Optional, TypedDict
 import yaml
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
 import pyperclip
 from pynput import keyboard
 
@@ -60,18 +64,10 @@ except ImportError:
 # python-docx (optional)
 try:
     from docx import Document
-    from docx.shared import Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
     _HAS_DOCX = True
 except ImportError:
     _HAS_DOCX = False
-
-# pyperclip (optional)
-try:
-    import pyperclip as _pyperclip
-    _HAS_PYPERCLIP = True
-except ImportError:
-    _HAS_PYPERCLIP = False
 
 
 # =========================================================================
@@ -189,6 +185,46 @@ def load_config() -> AppConfig:
 
 
 # =========================================================================
+# Tastenbelegung – pynput Key-Objekte
+# =========================================================================
+
+_KEY_MAP = {
+    "ctrl_r":  keyboard.Key.ctrl_r,
+    "ctrl_l":  keyboard.Key.ctrl_l,
+    "alt_r":   keyboard.Key.alt_r,
+    "alt_l":   keyboard.Key.alt_l,
+    "shift_r": keyboard.Key.shift_r,
+    "f1":  keyboard.Key.f1,  "f2":  keyboard.Key.f2,
+    "f3":  keyboard.Key.f3,  "f4":  keyboard.Key.f4,
+    "f5":  keyboard.Key.f5,  "f6":  keyboard.Key.f6,
+    "f7":  keyboard.Key.f7,  "f8":  keyboard.Key.f8,
+    "f9":  keyboard.Key.f9,  "f10": keyboard.Key.f10,
+    "f11": keyboard.Key.f11, "f12": keyboard.Key.f12,
+}
+
+
+def resolve_key(name: str):
+    """Löst einen Tastennamen in ein pynput-Key-Objekt auf."""
+    return _KEY_MAP.get(name.lower(), keyboard.Key.ctrl_r)
+
+
+# =========================================================================
+# Audio-Hilfsfunktionen
+# =========================================================================
+
+def rms(audio_data: np.ndarray) -> float:
+    if audio_data.size == 0:
+        return 0.0
+    val = float(np.sqrt(np.mean(np.square(audio_data.astype(np.float32)))))
+    return max(0.0, val - 0.003)
+
+
+def level_bar(rms_val: float, width: int = 30) -> str:
+    filled = int(min(rms_val / 0.15, 1.0) * width)
+    return "[" + "█" * filled + "░" * (width - filled) + f"] {rms_val:.3f}"
+
+
+# =========================================================================
 # Korrektur-Prompt
 # =========================================================================
 
@@ -217,13 +253,9 @@ Korrekturregeln:
    - "Klammer zu" -> )
    - "Anfuehrungszeichen auf" -> \u201e
    - "Anfuehrungszeichen zu" / "Anfuehrungszeichen Ende" -> \u201c
-2. Normzitate: "Paragraph 823 Absatz 2 Satz 1 BGB" -> "\u00a7 823 Abs. 2 S. 1 BGB". \
-Bereits diktierte Zitate korrekt formatieren, KEINE neuen Normen hinzufuegen.
+2. Normzitate: "Paragraph 823 Absatz 2 Satz 1 BGB" -> "\u00a7 823 Abs. 2 S. 1 BGB"
 3. Abkuerzungen: Nur standardisierte juristische Abkuerzungen (vgl., i.V.m., i.S.d.)
-4. Stil:
-   - Direkt und verstaendlich formulieren, NICHT uebermassig passivieren
-   - Aktivsaetze bevorzugen
-   - Klare, lebhafte Sprache – kein Kanzleideutsch
+4. Stil: Direkt und verstaendlich, Aktivsaetze bevorzugen, kein Kanzleideutsch
 5. Interpunktion: Korrekte deutsche Zeichensetzung
 6. Grammatik: Korrekte Deklination, Konjugation, Kongruenz
 7. Rechtschreibung: Korrekte deutsche Rechtschreibung (Duden)
@@ -234,7 +266,7 @@ Bereits diktierte Zitate korrekt formatieren, KEINE neuen Normen hinzufuegen.
    - "neuer Absatz" -> Absatzumbruch
 10. Waehrung: Immer "EUR"
 11. Prozent: Immer Zahl + Leerzeichen + % (z.B. "50 %")
-12. Doppelwoerter aus Transkriptionsfehlern entfernen (z.B. "der der Klaeger" -> "der Klaeger")
+12. Doppelwoerter entfernen (z.B. "der der Klaeger" -> "der Klaeger")
 
 Antworte NUR mit dem korrigierten Text, ohne Erklaerungen oder Kommentare.\
 """
@@ -250,7 +282,7 @@ CORRECTION_FULL_PREFIX = "{text}"
 
 
 # =========================================================================
-# Hilfsfunktionen
+# Ollama-Hilfsfunktionen
 # =========================================================================
 
 def _call_ollama(
@@ -262,7 +294,6 @@ def _call_ollama(
     max_tokens: int = 4096,
     timeout: int = 120,
 ) -> str:
-    """Ruft die Ollama /api/chat Schnittstelle auf."""
     payload = json.dumps({
         "model": model,
         "messages": [
@@ -286,7 +317,6 @@ def _call_ollama(
 
 
 def _check_ollama(base_url: str, timeout: int = 3) -> bool:
-    """Prüft ob Ollama erreichbar ist."""
     try:
         urllib.request.urlopen(f"{base_url}/api/tags", timeout=timeout)
         return True
@@ -295,7 +325,6 @@ def _check_ollama(base_url: str, timeout: int = 3) -> bool:
 
 
 def _list_ollama_models(base_url: str) -> list[str]:
-    """Listet verfügbare Ollama-Modelle."""
     try:
         with urllib.request.urlopen(f"{base_url}/api/tags", timeout=3) as r:
             data = json.loads(r.read().decode("utf-8"))
@@ -304,8 +333,11 @@ def _list_ollama_models(base_url: str) -> list[str]:
         return []
 
 
+# =========================================================================
+# Geräteauswahl
+# =========================================================================
+
 def choose_input_device() -> int:
-    """Lässt den Nutzer ein Eingabegerät wählen."""
     devices = sd.query_devices()
     inputs = [(i, d) for i, d in enumerate(devices) if d["max_input_channels"] > 0]
     if not inputs:
@@ -334,16 +366,11 @@ class Transcriber:
 
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self._model: Optional["WhisperModel"] = None
+        self._model = None
 
     def _load(self):
         if self._model is not None:
             return
-        if not _HAS_FASTER_WHISPER:
-            sys.exit(
-                "FEHLER: faster-whisper nicht installiert.\n"
-                "  pip install faster-whisper"
-            )
         t_cfg = self.cfg["transcription"]
         print(f"  Lade Whisper-Modell '{t_cfg['model']}' "
               f"({t_cfg['device']}/{t_cfg['compute_type']}) …", end=" ", flush=True)
@@ -354,15 +381,9 @@ class Transcriber:
         )
         print("OK")
 
-    def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
-        """Transkribiert ein Audio-Array."""
+    def transcribe(self, audio: np.ndarray) -> str:
+        """Transkribiert ein float32-Audio-Array."""
         self._load()
-        # FasterWhisper erwartet float32 mono, 16kHz
-        if audio.dtype != np.float32:
-            audio = audio.astype(np.float32)
-        if audio.max() > 1.0:
-            audio = audio / 32768.0
-
         lang = self.cfg["transcription"]["language"]
         segments, _ = self._model.transcribe(
             audio,
@@ -378,229 +399,224 @@ class Transcriber:
 # =========================================================================
 
 class DictationSession:
-    """Eine einzelne Diktiersitzung."""
+    """Kapselt eine vollständige Diktat-Sitzung."""
 
     def __init__(self, cfg: AppConfig, transcriber: Transcriber):
         self.cfg = cfg
         self.transcriber = transcriber
 
+        # Audio
         self.audio_queue: queue.Queue = queue.Queue()
-        self.segments: list[str] = []
-        self._recording = False
-        self._paused = False
-        self._stop = False
+        self.sample_rate: int = cfg["audio"]["sample_rate"]
+        self.channels: int = cfg["audio"]["channels"]
+        self.blocksize: int = cfg["audio"]["blocksize"]
+
+        # Zustand
+        self.recording = False
+        self.paused = False
+        self.segment_chunks: list[np.ndarray] = []
+        self.text_blocks: list[str] = []
+        self.finished = False
+        self.aborted = False
+        self.lock = threading.Lock()
+
+        # Verarbeitungs-Lock: verhindert parallele Segment-Verarbeitung
         self._processing_lock = threading.Lock()
 
-        # Tastenbelegung
-        ctrl = self.cfg["controls"]
-        self._ptk = ctrl["push_to_talk_key"].lower()
-        self._pause_key = ctrl["pause_key"].lower()
-        self._reject_key = ctrl["reject_segment_key"].lower()
+        # Tasten – als pynput Key-Objekte auflösen
+        ctrl = cfg["controls"]
+        self.ptt_key = resolve_key(ctrl["push_to_talk_key"])
+        self.pause_key = resolve_key(ctrl["pause_key"])
+        self.reject_key = resolve_key(ctrl["reject_segment_key"])
 
     # ------------------------------------------------------------------
-    # Tastatur
+    # Audio-Callback + Worker
     # ------------------------------------------------------------------
 
-    def _key_name(self, key) -> str:
-        try:
-            return key.char.lower() if key.char else ""
-        except AttributeError:
-            return str(key).lower().replace("key.", "")
+    def audio_callback(self, indata, frames, time_info, status):
+        """Sounddevice-Callback: schreibt immer in die Queue."""
+        self.audio_queue.put(indata.copy())
 
-    def _on_press(self, key):
-        name = self._key_name(key)
-        if name == "esc":
-            self._stop = True
-            return False
-        if name == self._pause_key:
-            self._paused = not self._paused
-            state = "PAUSE" if self._paused else "WEITER"
-            print(f"\n  [{state}]", flush=True)
-        if name == self._reject_key:
-            if self.segments:
-                removed = self.segments.pop()
-                print(f"\n  [Verworfen] {removed[:60]}…" if len(removed) > 60
-                      else f"\n  [Verworfen] {removed}", flush=True)
+    def recording_worker(self):
+        """Hintergrund-Thread: sammelt Chunks + Live-Pegel."""
+        while not self.finished and not self.aborted:
+            try:
+                chunk = self.audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            with self.lock:
+                if self.recording and not self.paused:
+                    self.segment_chunks.append(chunk)
+                    r = rms(chunk.flatten())
+                    bar = level_bar(r)
+                    print(f"\r  ● REC {bar}", end="", flush=True)
 
-    def _on_release(self, key):
-        pass
-
-    # ------------------------------------------------------------------
-    # Audio-Aufnahme
-    # ------------------------------------------------------------------
-
-    def _audio_callback(self, indata, frames, time_info, status):
-        if self._recording and not self._paused:
-            self.audio_queue.put(indata.copy())
-
-    def _rms(self, data: np.ndarray) -> float:
-        return float(np.sqrt(np.mean(data.astype(np.float32) ** 2)))
-
-    def _collect_audio(self) -> np.ndarray:
-        chunks = []
+    def drain_queue(self):
         while not self.audio_queue.empty():
-            chunks.append(self.audio_queue.get_nowait())
-        return np.concatenate(chunks, axis=0) if chunks else np.array([], dtype=np.int16)
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
     # ------------------------------------------------------------------
-    # Segmentverarbeitung
+    # Segment-Verarbeitung
     # ------------------------------------------------------------------
 
-    def _process_segment(self, audio: np.ndarray):
-        """Transkribiert und korrigiert ein Audiosegment."""
-        sr = self.cfg["audio"]["sample_rate"]
+    def process_segment(self) -> str:
+        with self.lock:
+            if not self.segment_chunks:
+                return ""
+            audio_data = np.concatenate(self.segment_chunks, axis=0).flatten()
+            self.segment_chunks.clear()
+
+        if audio_data.size == 0:
+            return ""
+
         threshold = self.cfg["audio"]["silence_threshold_rms"]
+        if rms(audio_data) < threshold:
+            print("  (Stille – übersprungen)")
+            return ""
 
-        if self._rms(audio) < threshold:
+        # float32 normalisieren
+        audio_f32 = audio_data.astype(np.float32)
+        if audio_f32.max() > 1.0:
+            audio_f32 /= 32768.0
+
+        duration = len(audio_f32) / self.sample_rate
+        print(f"\n  Transkribiere ({duration:.1f}s) …", flush=True)
+        text = self.transcriber.transcribe(audio_f32)
+
+        if not text:
+            print("  (kein Text erkannt)")
+            return ""
+
+        print(f"  -> {text}")
+        return text
+
+    def _process_and_store(self):
+        if not self._processing_lock.acquire(blocking=False):
+            print("\n  (Verarbeitung läuft noch – bitte warten)")
             return
-
-        with self._processing_lock:
-            print(f"\n  Transkribiere ({len(audio)/sr:.1f}s) …", flush=True)
-            text = self.transcriber.transcribe(audio, sr)
-            if not text:
-                print("  (kein Text erkannt)")
-                return
-            print(f"  -> {text}")
-
-            if self.cfg["controls"]["segment_review"]:
-                print("  [Enter=Übernehmen  F9=Verwerfen] ", end="", flush=True)
-
-            self.segments.append(text)
-
-            if self.cfg["controls"]["segment_review"]:
-                # Kurz warten ob F9 gedrückt wird
-                time.sleep(0.8)
-                if self.segments and self.segments[-1] == text:
-                    print("Übernommen")
-                # (F9-Handler hat ggf. bereits verworfen)
+        try:
+            text = self.process_segment()
+            if text:
+                with self.lock:
+                    self.text_blocks.append(text)
+                if self.cfg["controls"]["segment_review"]:
+                    print("  ✓ Übernommen (F9 zum Verwerfen)")
+                else:
+                    print("  ✓ Gespeichert")
+                self._print_controls()
+        finally:
+            self._processing_lock.release()
 
     # ------------------------------------------------------------------
-    # Push-to-Talk Hauptschleife
+    # Anzeige
     # ------------------------------------------------------------------
 
     def _print_controls(self):
+        ptt = self.cfg["controls"]["push_to_talk_key"].upper()
         model = self.cfg["correction"]["model"]
-        ctrl = self.cfg["controls"]
-        print(f"\n  Korrektur-KI: Ollama ({model})")
-        print(f"  [{ctrl['push_to_talk_key'].upper()}]=Aufnahme  "
-              f"[{ctrl['reject_segment_key'].upper()}]=Verwerfen  "
-              f"[{ctrl['pause_key'].upper()}]=Pause  [ESC]=Beenden")
+        n = len(self.text_blocks)
+        print(f"  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+        print(f"  {n} Segment{'e' if n != 1 else ''} │ Ollama: {model} │ "
+              f"[{ptt}]=Aufnahme  [F9]=Verwerfen  [F10]=Pause  [ESC]=Beenden")
+
+    # ------------------------------------------------------------------
+    # Tastatur-Handler
+    # ------------------------------------------------------------------
+
+    def on_key_press(self, key):
+        if key == self.ptt_key:
+            with self.lock:
+                if self.paused:
+                    return
+                if not self.recording:
+                    self.recording = True
+                    self.drain_queue()
+                    self.segment_chunks.clear()
+                    print("\r  ● REC ", end="", flush=True)
+
+    def on_key_release(self, key):
+        if key == self.ptt_key:
+            with self.lock:
+                if not self.recording:
+                    return
+                self.recording = False
+            print("\r  ■ STOPP" + " " * 50)
+            threading.Thread(target=self._process_and_store, daemon=True).start()
+
+        elif key == self.reject_key:
+            with self.lock:
+                if self.text_blocks:
+                    removed = self.text_blocks.pop()
+                    short = removed[:80] + "…" if len(removed) > 80 else removed
+                    print(f"\n  ✗ Verworfen: {short}")
+                else:
+                    print("\n  (Keine Segmente zum Verwerfen)")
+            self._print_controls()
+
+        elif key == self.pause_key:
+            with self.lock:
+                self.paused = not self.paused
+                status = "PAUSIERT" if self.paused else "FORTGESETZT"
+            print(f"\n  [{status}]")
+            self._print_controls()
+
+        elif key == keyboard.Key.esc:
+            print("\n\n  [ESC] Diktat beenden …")
+            self.finished = True
+            return False
+
+    # ------------------------------------------------------------------
+    # Hauptschleife
+    # ------------------------------------------------------------------
 
     def run(self, device_idx: int):
-        """Startet die Diktiersitzung."""
-        sr = self.cfg["audio"]["sample_rate"]
-        bs = self.cfg["audio"]["blocksize"]
-
+        ptt_name = self.cfg["controls"]["push_to_talk_key"].upper()
+        print(f"\n  Bereit – halte [{ptt_name}] zum Sprechen.\n")
         self._print_controls()
 
-        # Prüfe ob Push-to-Talk ctrl_r oder einfache Taste ist
-        ptk = self._ptk  # z.B. "ctrl_r" oder "f8"
-        is_ctrl_combo = ptk.startswith("ctrl_")
-        trigger_key = ptk.split("_")[1] if is_ctrl_combo else ptk
-
-        recording_buffer: list[np.ndarray] = []
-        ctrl_held = False
-        trigger_held = False
-
-        def on_press(key):
-            nonlocal ctrl_held, trigger_held
-            name = self._key_name(key)
-
-            # ESC
-            if name == "esc":
-                self._stop = True
-                return False
-
-            # Pause
-            if name == self._pause_key:
-                self._paused = not self._paused
-                state = "PAUSE" if self._paused else "WEITER"
-                print(f"\n  [{state}]", flush=True)
-                return
-
-            # Verwerfen
-            if name == self._reject_key and self.segments:
-                removed = self.segments.pop()
-                short = removed[:60] + "…" if len(removed) > 60 else removed
-                print(f"\n  [Verworfen] {short}", flush=True)
-                return
-
-            # Push-to-Talk
-            if is_ctrl_combo:
-                if name in ("ctrl_l", "ctrl_r", "ctrl"):
-                    ctrl_held = True
-                if name == trigger_key and ctrl_held and not self._recording:
-                    self._recording = True
-                    print("\n  ■ AUFNAHME …", end=" ", flush=True)
-            else:
-                if name == trigger_key and not self._recording:
-                    self._recording = True
-                    print("\n  ■ AUFNAHME …", end=" ", flush=True)
-
-        def on_release(key):
-            nonlocal ctrl_held, trigger_held
-            name = self._key_name(key)
-
-            if is_ctrl_combo:
-                if name in ("ctrl_l", "ctrl_r", "ctrl"):
-                    ctrl_held = False
-                    if self._recording:
-                        self._recording = False
-                        audio = self._collect_audio()
-                        if len(audio) > sr * 0.3:
-                            t = threading.Thread(
-                                target=self._process_segment, args=(audio,), daemon=True
-                            )
-                            t.start()
-                        else:
-                            print("  (zu kurz)")
-                if name == trigger_key:
-                    trigger_held = False
-            else:
-                if name == trigger_key and self._recording:
-                    self._recording = False
-                    audio = self._collect_audio()
-                    if len(audio) > sr * 0.3:
-                        t = threading.Thread(
-                            target=self._process_segment, args=(audio,), daemon=True
-                        )
-                        t.start()
-                    else:
-                        print("  (zu kurz)")
-
-        with sd.InputStream(
+        stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            blocksize=self.blocksize,
             device=device_idx,
-            channels=self.cfg["audio"]["channels"],
-            samplerate=sr,
-            blocksize=bs,
-            dtype="int16",
-            callback=self._audio_callback,
-        ):
-            with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            dtype="float32",
+            callback=self.audio_callback,
+        )
+
+        worker = threading.Thread(target=self.recording_worker, daemon=True)
+        worker.start()
+
+        with stream:
+            with keyboard.Listener(
+                on_press=self.on_key_press,
+                on_release=self.on_key_release,
+            ) as listener:
                 listener.join()
 
-        # Warte auf laufende Verarbeitung
-        self._processing_lock.acquire()
-        self._processing_lock.release()
+        worker.join(timeout=2.0)
 
-        self._finalize()
-
-    # ------------------------------------------------------------------
-    # Abschluss: Korrektur und Ausgabe
-    # ------------------------------------------------------------------
-
-    def _finalize(self):
-        print(f"\n  [ESC] Diktat beenden …")
-        if not self.segments:
-            print("  Kein Text diktiert.")
+        if self.aborted:
+            print("\n  Diktat abgebrochen.")
             return
 
-        raw_text = "\n\n".join(self.segments)
+        with self.lock:
+            blocks = list(self.text_blocks)
+
+        if not blocks:
+            print("\n  Kein Text aufgenommen.")
+            return
+
+        raw_text = "\n\n".join(blocks)
+
         print(f"\n{'=' * 60}")
-        print(f"  ROHTEXT ({len(self.segments)} Segment{'e' if len(self.segments) != 1 else ''})")
+        print(f"  ROHTEXT ({len(blocks)} Segment{'e' if len(blocks) != 1 else ''})")
         print(f"{'–' * 60}")
-        print(raw_text)
-        print(f"{'–' * 60}")
+        print(raw_text[:800])
+        if len(raw_text) > 800:
+            print("  …")
 
         # Korrektur
         corrected = self._correct(raw_text)
@@ -611,19 +627,21 @@ class DictationSession:
         print(corrected)
         print(f"{'=' * 60}")
 
-        # In Zwischenablage
-        if _HAS_PYPERCLIP:
-            try:
-                _pyperclip.copy(corrected)
-                print("  -> In Zwischenablage kopiert")
-            except Exception:
-                pass
+        # Zwischenablage
+        try:
+            pyperclip.copy(corrected)
+            print("  -> In Zwischenablage kopiert")
+        except Exception:
+            pass
 
         # Speichern
         self._save(corrected)
 
+    # ------------------------------------------------------------------
+    # Korrektur via Ollama
+    # ------------------------------------------------------------------
+
     def _correct(self, text: str) -> str:
-        """Korrigiert den Text via Ollama."""
         cfg = self.cfg["correction"]
         base_url = cfg["ollama_base_url"]
         model = cfg["model"]
@@ -645,7 +663,6 @@ class DictationSession:
                     )
                 else:
                     prompt = CORRECTION_FULL_PREFIX.format(text=para)
-
                 result = self._call_with_retry(base_url, model, prompt, temp, max_tokens)
                 corrected.append(result)
                 prev_context = result
@@ -686,8 +703,12 @@ class DictationSession:
                 else:
                     print(f"\n  [Fehler nach {max_retries} Versuchen: {exc}]",
                           file=sys.stderr)
-                    return user_prompt  # Rohtext als Fallback
+                    return user_prompt
         return user_prompt
+
+    # ------------------------------------------------------------------
+    # Speichern
+    # ------------------------------------------------------------------
 
     def _save(self, text: str):
         out_cfg = self.cfg["output"]
@@ -711,10 +732,8 @@ class DictationSession:
             doc = Document(template)
         else:
             doc = Document()
-
         font_name = cfg.get("docx_font", "Arial")
         font_size = cfg.get("docx_font_size_pt", 11)
-
         for block in text.split("\n\n"):
             block = block.strip()
             if not block:
@@ -726,7 +745,6 @@ class DictationSession:
             run = p.add_run(block)
             run.font.name = font_name
             run.font.size = Pt(font_size)
-
         doc.save(path)
 
 
@@ -748,32 +766,27 @@ def main():
     print("  KI-Diktat-Ollama – Vollständig lokale Lösung")
     print("=" * 60)
 
-    # Ollama prüfen
     if not _check_ollama(base_url):
         sys.exit(
             f"FEHLER: Ollama nicht erreichbar ({base_url})\n"
             "  Starte Ollama: ollama serve"
         )
 
-    # Verfügbare Modelle anzeigen
     available = _list_ollama_models(base_url)
     print(f"\n  Ollama erreichbar: {base_url}")
     if available:
         print(f"  Verfügbare Modelle: {', '.join(available)}")
 
-    # Aktuelles Modell prüfen
     current_model = cfg["correction"]["model"]
     if available and current_model not in available:
-        print(f"\n  [Warnung] Modell '{current_model}' nicht in Ollama verfügbar.")
+        print(f"\n  [Warnung] Modell '{current_model}' nicht verfügbar.")
         print(f"  Tipp: ollama pull {current_model}")
 
-    # Transkriptions-Modell
     t_cfg = cfg["transcription"]
     print(f"\n  Transkription: FasterWhisper '{t_cfg['model']}' "
           f"({t_cfg['device']}/{t_cfg['compute_type']})")
     print(f"  Korrektur:     Ollama ({current_model})")
 
-    # Mikrofon wählen
     try:
         device_idx = choose_input_device()
     except (RuntimeError, ValueError) as exc:
@@ -782,15 +795,14 @@ def main():
     dev_info = sd.query_devices(device_idx)
     print(f"\n  Verwende: [{device_idx}] {dev_info['name']}")
 
-    # Transcriber einmal erstellen (Modell wird beim ersten Diktat geladen)
+    # Transcriber einmal erstellen – Modell wird beim ersten Diktat geladen
     transcriber = Transcriber(cfg)
 
-    # Session-Schleife
     diktat_nr = 0
     while True:
         diktat_nr += 1
-
         model = cfg["correction"]["model"]
+
         if diktat_nr > 1:
             print(f"\n{'=' * 60}")
             print(f"  Neues Diktat #{diktat_nr}  (Ollama: {model})")
@@ -816,13 +828,10 @@ def main():
                 choice = "q"
 
             if choice in ("b", "modell", "wechseln"):
-                # Reihenfolge: mistral-small:latest <-> gemma3:latest
                 order = AVAILABLE_MODELS
                 current = cfg["correction"]["model"]
                 next_idx = (order.index(current) + 1) % len(order) if current in order else 0
                 next_model = order[next_idx]
-
-                # Verfügbarkeit prüfen
                 if available and next_model not in available:
                     print(f"\n  [!] '{next_model}' nicht in Ollama – "
                           f"Tipp: ollama pull {next_model}")
